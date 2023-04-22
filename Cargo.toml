@@ -41,6 +41,7 @@ __internal_use_only_features_that_work_on_stable = ["alloc", "simd"]
 
 [dependencies]
 zerocopy-derive = { version = "=0.7.0-alpha.3", path = "zerocopy-derive" }
+yoke = { version = "0.7" }
 
 [dependencies.byteorder]
 version = "1.3"

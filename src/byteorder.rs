@@ -648,7 +648,7 @@ mod tests {
             for _ in 0..1024 {
                 let native = T::Native::rand();
                 let mut bytes = T::ByteArray::default();
-                bytes.as_bytes_mut().copy_from_slice(native.as_bytes());
+                bytes.as_mut_bytes().copy_from_slice(native.as_bytes());
                 let mut from_native = T::new(native);
                 let from_bytes = T::from_bytes(bytes);
                 assert_eq!(from_native, from_bytes);
@@ -672,7 +672,7 @@ mod tests {
             for _ in 0..1024 {
                 let native = T::Native::rand();
                 let mut bytes = T::ByteArray::default();
-                bytes.as_bytes_mut().copy_from_slice(native.as_bytes());
+                bytes.as_mut_bytes().copy_from_slice(native.as_bytes());
                 bytes = bytes.invert();
                 let mut from_native = T::new(native);
                 let from_bytes = T::from_bytes(bytes);

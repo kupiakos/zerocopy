@@ -136,6 +136,7 @@
 pub mod byteorder;
 #[doc(hidden)]
 pub mod derive_util;
+mod maybe_valid;
 
 #[cfg(feature = "byteorder")]
 pub use crate::byteorder::*;
@@ -164,6 +165,12 @@ use {
     alloc::vec::Vec,
     core::{alloc::Layout, ptr::NonNull},
 };
+
+mod align;
+mod bytes;
+pub use bytes::Bytes;
+mod try_from_bytes;
+pub(crate) mod util;
 
 // This is a hack to allow derives of `FromZeroes`, `FromBytes`, `AsBytes`, and
 // `Unaligned` to work in this crate. They assume that zerocopy is linked as an
@@ -582,7 +589,7 @@ pub unsafe trait AsBytes {
     ///
     /// `as_bytes_mut` provides access to the bytes of this value as a mutable
     /// byte slice.
-    fn as_bytes_mut(&mut self) -> &mut [u8]
+    fn as_mut_bytes(&mut self) -> &mut [u8]
     where
         Self: FromBytes,
     {
@@ -2182,7 +2189,7 @@ where
 impl<B, T> LayoutVerified<B, T>
 where
     B: ByteSliceMut,
-    T: FromBytes + AsBytes,
+    T: FromBytes + AsBytes, // TODO(kupiakos): this shouldn't require
 {
     /// Creates a mutable reference to `T` with a specific lifetime.
     ///
@@ -2626,9 +2633,19 @@ mod sealed {
 /// method would involve reallocation, and `split_at` must be a very cheap
 /// operation in order for the utilities in this crate to perform as designed.
 ///
+/// For more flexible behavior, see the [`yoke`] library.
+///
 /// [`Vec<u8>`]: alloc::vec::Vec
 /// [`split_at`]: crate::ByteSlice::split_at
+/// [`yoke`]: https://docs.rs/yoke/latest/yoke/struct.Yoke.html
 pub unsafe trait ByteSlice: Deref<Target = [u8]> + Sized + self::sealed::Sealed {
+    /// The type of wrapping a `T` to have a shared ownership as `Self`.
+    /// TODO: be more clear, rename maybe
+    type Cast<'a, T>: Deref<Target = T>
+    where
+        Self: 'a,
+        T: 'a;
+
     /// Gets a raw pointer to the first byte in the slice.
     #[inline]
     fn as_ptr(&self) -> *const u8 {
@@ -2643,6 +2660,12 @@ pub unsafe trait ByteSlice: Deref<Target = [u8]> + Sized + self::sealed::Sealed 
     ///
     /// `x.split_at(mid)` panics if `mid > x.len()`.
     fn split_at(self, mid: usize) -> (Self, Self);
+
+    // T must be `AsBytes` if `Self::Cast<'a, T>: DerefMut`.
+    unsafe fn cast_as_unchecked<'a, T>(self) -> Self::Cast<'a, T>
+    where
+        Self: 'a,
+        T: FromBytes + 'a;
 }
 
 #[allow(clippy::missing_safety_doc)] // TODO(fxbug.dev/99068)
@@ -2652,6 +2675,11 @@ pub unsafe trait ByteSlice: Deref<Target = [u8]> + Sized + self::sealed::Sealed 
 /// a byte slice, and is implemented for various special reference types such as
 /// `RefMut<[u8]>`.
 pub unsafe trait ByteSliceMut: ByteSlice + DerefMut {
+    // type CastMut<'a, T>: DerefMut<Target = T>
+    // where
+    //     Self: 'a,
+    //     T: 'a;
+
     /// Gets a mutable raw pointer to the first byte in the slice.
     #[inline]
     fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -2662,36 +2690,74 @@ pub unsafe trait ByteSliceMut: ByteSlice + DerefMut {
 // TODO(#61): Add a "SAFETY" comment and remove this `allow`.
 #[allow(clippy::undocumented_unsafe_blocks)]
 unsafe impl<'a> ByteSlice for &'a [u8] {
+    type Cast<'b, T> = &'b T where Self: 'b, T: 'b;
+
     #[inline]
     fn split_at(self, mid: usize) -> (Self, Self) {
         <[u8]>::split_at(self, mid)
+    }
+
+    unsafe fn cast_as_unchecked<'b, T>(self) -> Self::Cast<'b, T>
+    where
+        Self: 'b,
+        T: FromBytes + 'b,
+    {
+        unsafe { &*self.as_ptr().cast() }
     }
 }
 
 // TODO(#61): Add a "SAFETY" comment and remove this `allow`.
 #[allow(clippy::undocumented_unsafe_blocks)]
 unsafe impl<'a> ByteSlice for &'a mut [u8] {
+    type Cast<'b, T> = &'b mut T where Self: 'b, T: 'b;
+
     #[inline]
     fn split_at(self, mid: usize) -> (Self, Self) {
         <[u8]>::split_at_mut(self, mid)
+    }
+
+    unsafe fn cast_as_unchecked<'b, T>(self) -> Self::Cast<'b, T>
+    where
+        Self: 'b,
+        T: FromBytes + 'b,
+    {
+        unsafe { &mut *self.as_mut_ptr().cast() }
     }
 }
 
 // TODO(#61): Add a "SAFETY" comment and remove this `allow`.
 #[allow(clippy::undocumented_unsafe_blocks)]
 unsafe impl<'a> ByteSlice for Ref<'a, [u8]> {
+    type Cast<'b, T> = Ref<'b, T> where Self: 'b, T: 'b;
     #[inline]
     fn split_at(self, mid: usize) -> (Self, Self) {
         Ref::map_split(self, |slice| <[u8]>::split_at(slice, mid))
+    }
+
+    unsafe fn cast_as_unchecked<'b, T>(self) -> Self::Cast<'b, T>
+    where
+        Self: 'b,
+        T: FromBytes + 'b,
+    {
+        Ref::map(self, |x| LayoutVerified::<&'a [u8], T>::new(x).unwrap_unchecked().into_ref())
     }
 }
 
 // TODO(#61): Add a "SAFETY" comment and remove this `allow`.
 #[allow(clippy::undocumented_unsafe_blocks)]
 unsafe impl<'a> ByteSlice for RefMut<'a, [u8]> {
+    type Cast<'b, T> = RefMut<'b, T> where Self: 'b, T: 'b;
     #[inline]
     fn split_at(self, mid: usize) -> (Self, Self) {
         RefMut::map_split(self, |slice| <[u8]>::split_at_mut(slice, mid))
+    }
+
+    unsafe fn cast_as_unchecked<'b, T>(self) -> Self::Cast<'b, T>
+    where
+        Self: 'b,
+        T: FromBytes + 'b,
+    {
+        RefMut::map(self, |x| unsafe { &mut *x.as_mut_ptr().cast::<T>() })
     }
 }
 
@@ -3775,9 +3841,9 @@ mod tests {
 
             // Test that changes to the underlying byte slices are reflected in
             // the original object.
-            t.as_bytes_mut()[0] ^= 0xFF;
+            t.as_mut_bytes()[0] ^= 0xFF;
             assert_eq!(t, post_mutation);
-            t.as_bytes_mut()[0] ^= 0xFF;
+            t.as_mut_bytes()[0] ^= 0xFF;
 
             // `write_to` rejects slices that are too small or too large.
             assert_eq!(t.write_to(&mut vec![0; N - 1][..]), None);
