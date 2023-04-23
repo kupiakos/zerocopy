@@ -7,11 +7,28 @@ use core::ops::Range;
 use super::*;
 // use util::TransparentWrapper;
 
-/// A `T` that provably has all of its bytes initialized.
-/// All bytes of `T` are initialized, so this object is `AsBytes`
+/// A wrapper around `T` that ensures all of its bytes are initialized.
+///
+/// # Capabilities
+///
+/// - `Bytes<T>` is `AsBytes` for all `T: NoInteriorMutable`.
+/// - `Bytes<T> where T: FromBytes` is `FromBytes`.
+///
+/// # Type invariant
+///
+/// - The interior of `self` cannot be mutated through a shared reference.
+///   `T` that contain interior mutability should be safe to wrap in `Bytes<T>`.
 #[repr(transparent)]
 #[derive(Debug)]
 pub struct Bytes<T: ?Sized>(T);
+
+impl<T: ?Sized + NoInteriorMutable> Deref for Bytes<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl<T: ?Sized> Bytes<T> {
     /// Wraps an `AsBytes` type in `Bytes`
@@ -55,9 +72,10 @@ impl<T: ?Sized> Bytes<T> {
     }
 
     /// Zero the bytes of `val` to construct a `&mut Bytes<T>`.
+    /// Requires `T: Frozen`
     pub fn new_mut_zeroed(val: &mut T) -> &mut Self
     where
-        T: FromZeroes,
+        T: FromZeroes + NoInteriorMutable,
     {
         val.zero();
         // SAFETY: `val` is all zero bytes
@@ -202,7 +220,7 @@ unsafe impl<T> MakeBytes for MaybeUninit<T> {
     const __PRIVATE_UNINIT_SPANS: &'static [Range<usize>] = &[0..core::mem::size_of::<T>()];
 }
 
-// not these types directly, maybe just `From`/`TryFrom`?
+// todo: not these types directly, maybe just `From`/`TryFrom`?
 trait LoosenContract<To> {}
 trait TransposeContract<To> {}
 trait TryCheckContract<To> {}

@@ -75,12 +75,12 @@
     patterns_in_fns_without_body,
     rust_2018_idioms,
     trivial_numeric_casts,
-    unreachable_pub,
     unsafe_op_in_unsafe_fn,
     unused_extern_crates,
     unused_qualifications,
     variant_size_differences
 )]
+#![warn(missing_docs, unreachable_pub)] //todo: remove
 #![deny(
     clippy::all,
     clippy::alloc_instead_of_core,
@@ -137,9 +137,22 @@ pub mod byteorder;
 #[doc(hidden)]
 pub mod derive_util;
 mod maybe_valid;
+mod from_bytes;
+mod from_zeroes;
+mod align;
+mod bytes;
+mod byte_slice;
+pub use bytes::Bytes;
+mod try_from_bytes;
+pub(crate) mod util;
 
 #[cfg(feature = "byteorder")]
 pub use crate::byteorder::*;
+pub use from_bytes::{FromBytes, LayoutError};
+pub use from_zeroes::FromZeroes;
+pub use byte_slice::{ByteSlice, ByteSliceMut, ReadOnlyByteSlice};
+pub use maybe_valid::{MaybeValid, NoInteriorMutable};
+pub use try_from_bytes::TryFromBytes;
 pub use zerocopy_derive::*;
 
 use core::{
@@ -166,12 +179,6 @@ use {
     core::{alloc::Layout, ptr::NonNull},
 };
 
-mod align;
-mod bytes;
-pub use bytes::Bytes;
-mod try_from_bytes;
-pub(crate) mod util;
-
 // This is a hack to allow derives of `FromZeroes`, `FromBytes`, `AsBytes`, and
 // `Unaligned` to work in this crate. They assume that zerocopy is linked as an
 // extern crate, so they access items from it as `zerocopy::Xxx`. This makes
@@ -180,323 +187,6 @@ mod zerocopy {
     pub(crate) use crate::*;
 }
 
-/// Types for which a sequence of bytes all set to zero represents a valid
-/// instance of the type.
-///
-/// WARNING: Do not implement this trait yourself! Instead, use
-/// `#[derive(FromZeroes)]`.
-///
-/// Any memory region of the appropriate length which is guaranteed to contain
-/// only zero bytes can be viewed as any `FromZeroes` type with no runtime
-/// overhead. This is useful whenever memory is known to be in a zeroed state,
-/// such memory returned from some allocation routines.
-///
-/// `FromZeroes` is ignorant of byte order. For byte order-aware types, see the
-/// [`byteorder`] module.
-///
-/// # Safety
-///
-/// If `T: FromZeroes`, then unsafe code may assume that it is sound to treat
-/// any initialized sequence of zero bytes of length `size_of::<T>()` as a `T`.
-/// If a type is marked as `FromZeroes` which violates this contract, it may
-/// cause undefined behavior.
-///
-/// If a type has the following properties, then it is safe to implement
-/// `FromZeroes` for that type:
-/// - If the type is a struct, all of its fields must implement `FromZeroes`
-/// - If the type is an enum, it must be C-like (meaning that all variants have
-///   no fields) and it must have a variant with a discriminant of `0` (see [the
-///   reference] for a description of how discriminant values are chosen)
-///
-/// [the reference]: https://doc.rust-lang.org/reference/items/enumerations.html#custom-discriminant-values-for-fieldless-enumerations
-///
-/// # Rationale
-///
-/// ## Why isn't an explicit representation required for structs?
-///
-/// Per the [Rust reference](reference),
-///
-/// > The representation of a type can change the padding between fields, but
-/// does not change the layout of the fields themselves.
-///
-/// [reference]: https://doc.rust-lang.org/reference/type-layout.html#representations
-///
-/// Since the layout of structs only consists of padding bytes and field bytes,
-/// a struct is soundly `FromZeroes` if:
-/// 1. its padding is soundly `FromZeroes`, and
-/// 2. its fields are soundly `FromZeroes`.
-///
-/// The answer to the first question is always yes: padding bytes do not have
-/// any validity constraints. A [discussion] of this question in the Unsafe Code
-/// Guidelines Working Group concluded that it would be virtually unimaginable
-/// for future versions of rustc to add validity constraints to padding bytes.
-///
-/// [discussion]: https://github.com/rust-lang/unsafe-code-guidelines/issues/174
-///
-/// Whether a struct is soundly `FromZeroes` therefore solely depends on whether
-/// its fields are `FromZeroes`.
-// TODO(#146): Document why we don't require an enum to have an explicit `repr`
-// attribute.
-pub unsafe trait FromZeroes {
-    // The `Self: Sized` bound makes it so that `FromZeroes` is still object
-    // safe.
-    #[doc(hidden)]
-    fn only_derive_is_allowed_to_implement_this_trait()
-    where
-        Self: Sized;
-
-    /// Overwrites `self` with zeroes.
-    ///
-    /// Sets every byte in `self` to 0. While this is similar to doing `*self =
-    /// Self::new_zeroed()`, it differs in that `zero` does not semantically
-    /// drop the current value and replace it with a new one - it simply
-    /// modifies the bytes of the existing value.
-    fn zero(&mut self) {
-        let slf: *mut Self = self;
-        let len = mem::size_of_val(self);
-        // SAFETY:
-        // - `self` is guaranteed by the type system to be valid for writes of
-        //   size `size_of_val(self)`.
-        // - `u8`'s alignment is 1, and thus `self` is guaranteed to be aligned
-        //   as required by `u8`.
-        // - Since `Self: FromZeroes`, the all-zeroes instance is a valid
-        //   instance of `Self.`
-        unsafe { ptr::write_bytes(slf.cast::<u8>(), 0, len) };
-    }
-
-    /// Creates an instance of `Self` from zeroed bytes.
-    fn new_zeroed() -> Self
-    where
-        Self: Sized,
-    {
-        // SAFETY: `FromZeroes` says that the all-zeroes bit pattern is legal.
-        unsafe { mem::zeroed() }
-    }
-
-    /// Creates a `Box<Self>` from zeroed bytes.
-    ///
-    /// This function is useful for allocating large values on the heap and
-    /// zero-initializing them, without ever creating a temporary instance of
-    /// `Self` on the stack. For example, `<[u8; 1048576]>::new_box_zeroed()`
-    /// will allocate `[u8; 1048576]` directly on the heap; it does not require
-    /// storing `[u8; 1048576]` in a temporary variable on the stack.
-    ///
-    /// On systems that use a heap implementation that supports allocating from
-    /// pre-zeroed memory, using `new_box_zeroed` (or related functions) may
-    /// have performance benefits.
-    ///
-    /// Note that `Box<Self>` can be converted to `Arc<Self>` and other
-    /// container types without reallocation.
-    ///
-    /// # Panics
-    ///
-    /// Panics if allocation of `size_of::<Self>()` bytes fails.
-    #[cfg(feature = "alloc")]
-    fn new_box_zeroed() -> Box<Self>
-    where
-        Self: Sized,
-    {
-        // If `T` is a ZST, then return a proper boxed instance of it. There is
-        // no allocation, but `Box` does require a correct dangling pointer.
-        let layout = Layout::new::<Self>();
-        if layout.size() == 0 {
-            return Box::new(Self::new_zeroed());
-        }
-
-        // TODO(#61): Add a "SAFETY" comment and remove this `allow`.
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        unsafe {
-            let ptr = alloc::alloc::alloc_zeroed(layout).cast::<Self>();
-            if ptr.is_null() {
-                alloc::alloc::handle_alloc_error(layout);
-            }
-            Box::from_raw(ptr)
-        }
-    }
-
-    /// Creates a `Box<[Self]>` (a boxed slice) from zeroed bytes.
-    ///
-    /// This function is useful for allocating large values of `[Self]` on the
-    /// heap and zero-initializing them, without ever creating a temporary
-    /// instance of `[Self; _]` on the stack. For example,
-    /// `u8::new_box_slice_zeroed(1048576)` will allocate the slice directly on
-    /// the heap; it does not require storing the slice on the stack.
-    ///
-    /// On systems that use a heap implementation that supports allocating from
-    /// pre-zeroed memory, using `new_box_slice_zeroed` may have performance
-    /// benefits.
-    ///
-    /// If `Self` is a zero-sized type, then this function will return a
-    /// `Box<[Self]>` that has the correct `len`. Such a box cannot contain any
-    /// actual information, but its `len()` property will report the correct
-    /// value.
-    ///
-    /// # Panics
-    ///
-    /// * Panics if `size_of::<Self>() * len` overflows.
-    /// * Panics if allocation of `size_of::<Self>() * len` bytes fails.
-    #[cfg(feature = "alloc")]
-    fn new_box_slice_zeroed(len: usize) -> Box<[Self]>
-    where
-        Self: Sized,
-    {
-        // TODO(#2): Use `Layout::repeat` when `alloc_layout_extra` is
-        // stabilized.
-        let layout = Layout::from_size_align(
-            mem::size_of::<Self>()
-                .checked_mul(len)
-                .expect("mem::size_of::<Self>() * len overflows `usize`"),
-            mem::align_of::<Self>(),
-        )
-        .expect("total allocation size overflows `isize`");
-
-        // TODO(#61): Add a "SAFETY" comment and remove this `allow`.
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        unsafe {
-            if layout.size() != 0 {
-                let ptr = alloc::alloc::alloc_zeroed(layout).cast::<Self>();
-                if ptr.is_null() {
-                    alloc::alloc::handle_alloc_error(layout);
-                }
-                Box::from_raw(slice::from_raw_parts_mut(ptr, len))
-            } else {
-                // `Box<[T]>` does not allocate when `T` is zero-sized or when
-                // `len` is zero, but it does require a non-null dangling
-                // pointer for its allocation.
-                Box::from_raw(slice::from_raw_parts_mut(NonNull::<Self>::dangling().as_ptr(), len))
-            }
-        }
-    }
-
-    /// Creates a `Vec<Self>` from zeroed bytes.
-    ///
-    /// This function is useful for allocating large values of `Vec`s and
-    /// zero-initializing them, without ever creating a temporary instance of
-    /// `[Self; _]` (or many temporary instances of `Self`) on the stack. For
-    /// example, `u8::new_vec_zeroed(1048576)` will allocate directly on the
-    /// heap; it does not require storing intermediate values on the stack.
-    ///
-    /// On systems that use a heap implementation that supports allocating from
-    /// pre-zeroed memory, using `new_vec_zeroed` may have performance benefits.
-    ///
-    /// If `Self` is a zero-sized type, then this function will return a
-    /// `Vec<Self>` that has the correct `len`. Such a `Vec` cannot contain any
-    /// actual information, but its `len()` property will report the correct
-    /// value.
-    ///
-    /// # Panics
-    ///
-    /// * Panics if `size_of::<Self>() * len` overflows.
-    /// * Panics if allocation of `size_of::<Self>() * len` bytes fails.
-    #[cfg(feature = "alloc")]
-    fn new_vec_zeroed(len: usize) -> Vec<Self>
-    where
-        Self: Sized,
-    {
-        Self::new_box_slice_zeroed(len).into()
-    }
-}
-
-/// Types for which any byte pattern is valid.
-///
-/// WARNING: Do not implement this trait yourself! Instead, use
-/// `#[derive(FromBytes)]`.
-///
-/// `FromBytes` types can safely be deserialized from an untrusted sequence of
-/// bytes because any byte sequence corresponds to a valid instance of the type.
-///
-/// `FromBytes` is ignorant of byte order. For byte order-aware types, see the
-/// [`byteorder`] module.
-///
-/// # Safety
-///
-/// If `T: FromBytes`, then unsafe code may assume that it is sound to treat any
-/// initialized sequence of bytes of length `size_of::<T>()` as a `T`. If a type
-/// is marked as `FromBytes` which violates this contract, it may cause
-/// undefined behavior.
-///
-/// If a type has the following properties, then it is safe to implement
-/// `FromBytes` for that type:
-/// - If the type is a struct, all of its fields must implement `FromBytes`
-/// - If the type is an enum:
-///   - It must be a C-like enum (meaning that all variants have no fields)
-///   - It must have a defined representation (`repr`s `C`, `u8`, `u16`, `u32`,
-///     `u64`, `usize`, `i8`, `i16`, `i32`, `i64`, or `isize`).
-///   - The maximum number of discriminants must be used (so that every possible
-///     bit pattern is a valid one). Be very careful when using the `C`,
-///     `usize`, or `isize` representations, as their size is
-///     platform-dependent.
-///
-/// # Rationale
-///
-/// ## Why isn't an explicit representation required for structs?
-///
-/// Per the [Rust reference](reference),
-///
-/// > The representation of a type can change the padding between fields, but
-/// does not change the layout of the fields themselves.
-///
-/// [reference]: https://doc.rust-lang.org/reference/type-layout.html#representations
-///
-/// Since the layout of structs only consists of padding bytes and field bytes,
-/// a struct is soundly `FromBytes` if:
-/// 1. its padding is soundly `FromBytes`, and
-/// 2. its fields are soundly `FromBytes`.
-///
-/// The answer to the first question is always yes: padding bytes do not have
-/// any validity constraints. A [discussion] of this question in the Unsafe Code
-/// Guidelines Working Group concluded that it would be virtually unimaginable
-/// for future versions of rustc to add validity constraints to padding bytes.
-///
-/// [discussion]: https://github.com/rust-lang/unsafe-code-guidelines/issues/174
-///
-/// Whether a struct is soundly `FromBytes` therefore solely depends on whether
-/// its fields are `FromBytes`.
-pub unsafe trait FromBytes: FromZeroes {
-    // The `Self: Sized` bound makes it so that `FromBytes` is still object
-    // safe.
-    #[doc(hidden)]
-    fn only_derive_is_allowed_to_implement_this_trait()
-    where
-        Self: Sized;
-
-    /// Reads a copy of `Self` from `bytes`.
-    ///
-    /// If `bytes.len() != size_of::<Self>()`, `read_from` returns `None`.
-    fn read_from<B: ByteSlice>(bytes: B) -> Option<Self>
-    where
-        Self: Sized,
-    {
-        let lv = LayoutVerified::<_, Unalign<Self>>::new_unaligned(bytes)?;
-        Some(lv.read().into_inner())
-    }
-
-    /// Reads a copy of `Self` from the prefix of `bytes`.
-    ///
-    /// `read_from_prefix` reads a `Self` from the first `size_of::<Self>()`
-    /// bytes of `bytes`. If `bytes.len() < size_of::<Self>()`, it returns
-    /// `None`.
-    fn read_from_prefix<B: ByteSlice>(bytes: B) -> Option<Self>
-    where
-        Self: Sized,
-    {
-        let (lv, _suffix) = LayoutVerified::<_, Unalign<Self>>::new_unaligned_from_prefix(bytes)?;
-        Some(lv.read().into_inner())
-    }
-
-    /// Reads a copy of `Self` from the suffix of `bytes`.
-    ///
-    /// `read_from_suffix` reads a `Self` from the last `size_of::<Self>()`
-    /// bytes of `bytes`. If `bytes.len() < size_of::<Self>()`, it returns
-    /// `None`.
-    fn read_from_suffix<B: ByteSlice>(bytes: B) -> Option<Self>
-    where
-        Self: Sized,
-    {
-        let (_prefix, lv) = LayoutVerified::<_, Unalign<Self>>::new_unaligned_from_suffix(bytes)?;
-        Some(lv.read().into_inner())
-    }
-}
 
 /// Types which are safe to treat as an immutable byte slice.
 ///
@@ -2621,153 +2311,6 @@ mod sealed {
 // unsafe code. Thus, we seal them and implement it only for known-good
 // reference types. For the same reason, they're unsafe traits.
 
-#[allow(clippy::missing_safety_doc)] // TODO(fxbug.dev/99068)
-/// A mutable or immutable reference to a byte slice.
-///
-/// `ByteSlice` abstracts over the mutability of a byte slice reference, and is
-/// implemented for various special reference types such as `Ref<[u8]>` and
-/// `RefMut<[u8]>`.
-///
-/// Note that, while it would be technically possible, `ByteSlice` is not
-/// implemented for [`Vec<u8>`], as the only way to implement the [`split_at`]
-/// method would involve reallocation, and `split_at` must be a very cheap
-/// operation in order for the utilities in this crate to perform as designed.
-///
-/// For more flexible behavior, see the [`yoke`] library.
-///
-/// [`Vec<u8>`]: alloc::vec::Vec
-/// [`split_at`]: crate::ByteSlice::split_at
-/// [`yoke`]: https://docs.rs/yoke/latest/yoke/struct.Yoke.html
-pub unsafe trait ByteSlice: Deref<Target = [u8]> + Sized + self::sealed::Sealed {
-    /// The type of wrapping a `T` to have a shared ownership as `Self`.
-    /// TODO: be more clear, rename maybe
-    type Cast<'a, T>: Deref<Target = T>
-    where
-        Self: 'a,
-        T: 'a;
-
-    /// Gets a raw pointer to the first byte in the slice.
-    #[inline]
-    fn as_ptr(&self) -> *const u8 {
-        <[u8]>::as_ptr(self)
-    }
-
-    /// Splits the slice at the midpoint.
-    ///
-    /// `x.split_at(mid)` returns `x[..mid]` and `x[mid..]`.
-    ///
-    /// # Panics
-    ///
-    /// `x.split_at(mid)` panics if `mid > x.len()`.
-    fn split_at(self, mid: usize) -> (Self, Self);
-
-    // T must be `AsBytes` if `Self::Cast<'a, T>: DerefMut`.
-    unsafe fn cast_as_unchecked<'a, T>(self) -> Self::Cast<'a, T>
-    where
-        Self: 'a,
-        T: FromBytes + 'a;
-}
-
-#[allow(clippy::missing_safety_doc)] // TODO(fxbug.dev/99068)
-/// A mutable reference to a byte slice.
-///
-/// `ByteSliceMut` abstracts over various ways of storing a mutable reference to
-/// a byte slice, and is implemented for various special reference types such as
-/// `RefMut<[u8]>`.
-pub unsafe trait ByteSliceMut: ByteSlice + DerefMut {
-    // type CastMut<'a, T>: DerefMut<Target = T>
-    // where
-    //     Self: 'a,
-    //     T: 'a;
-
-    /// Gets a mutable raw pointer to the first byte in the slice.
-    #[inline]
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        <[u8]>::as_mut_ptr(self)
-    }
-}
-
-// TODO(#61): Add a "SAFETY" comment and remove this `allow`.
-#[allow(clippy::undocumented_unsafe_blocks)]
-unsafe impl<'a> ByteSlice for &'a [u8] {
-    type Cast<'b, T> = &'b T where Self: 'b, T: 'b;
-
-    #[inline]
-    fn split_at(self, mid: usize) -> (Self, Self) {
-        <[u8]>::split_at(self, mid)
-    }
-
-    unsafe fn cast_as_unchecked<'b, T>(self) -> Self::Cast<'b, T>
-    where
-        Self: 'b,
-        T: FromBytes + 'b,
-    {
-        unsafe { &*self.as_ptr().cast() }
-    }
-}
-
-// TODO(#61): Add a "SAFETY" comment and remove this `allow`.
-#[allow(clippy::undocumented_unsafe_blocks)]
-unsafe impl<'a> ByteSlice for &'a mut [u8] {
-    type Cast<'b, T> = &'b mut T where Self: 'b, T: 'b;
-
-    #[inline]
-    fn split_at(self, mid: usize) -> (Self, Self) {
-        <[u8]>::split_at_mut(self, mid)
-    }
-
-    unsafe fn cast_as_unchecked<'b, T>(self) -> Self::Cast<'b, T>
-    where
-        Self: 'b,
-        T: FromBytes + 'b,
-    {
-        unsafe { &mut *self.as_mut_ptr().cast() }
-    }
-}
-
-// TODO(#61): Add a "SAFETY" comment and remove this `allow`.
-#[allow(clippy::undocumented_unsafe_blocks)]
-unsafe impl<'a> ByteSlice for Ref<'a, [u8]> {
-    type Cast<'b, T> = Ref<'b, T> where Self: 'b, T: 'b;
-    #[inline]
-    fn split_at(self, mid: usize) -> (Self, Self) {
-        Ref::map_split(self, |slice| <[u8]>::split_at(slice, mid))
-    }
-
-    unsafe fn cast_as_unchecked<'b, T>(self) -> Self::Cast<'b, T>
-    where
-        Self: 'b,
-        T: FromBytes + 'b,
-    {
-        Ref::map(self, |x| LayoutVerified::<&'a [u8], T>::new(x).unwrap_unchecked().into_ref())
-    }
-}
-
-// TODO(#61): Add a "SAFETY" comment and remove this `allow`.
-#[allow(clippy::undocumented_unsafe_blocks)]
-unsafe impl<'a> ByteSlice for RefMut<'a, [u8]> {
-    type Cast<'b, T> = RefMut<'b, T> where Self: 'b, T: 'b;
-    #[inline]
-    fn split_at(self, mid: usize) -> (Self, Self) {
-        RefMut::map_split(self, |slice| <[u8]>::split_at_mut(slice, mid))
-    }
-
-    unsafe fn cast_as_unchecked<'b, T>(self) -> Self::Cast<'b, T>
-    where
-        Self: 'b,
-        T: FromBytes + 'b,
-    {
-        RefMut::map(self, |x| unsafe { &mut *x.as_mut_ptr().cast::<T>() })
-    }
-}
-
-// TODO(#61): Add a "SAFETY" comment and remove this `allow`.
-#[allow(clippy::undocumented_unsafe_blocks)]
-unsafe impl<'a> ByteSliceMut for &'a mut [u8] {}
-
-// TODO(#61): Add a "SAFETY" comment and remove this `allow`.
-#[allow(clippy::undocumented_unsafe_blocks)]
-unsafe impl<'a> ByteSliceMut for RefMut<'a, [u8]> {}
 
 #[cfg(feature = "alloc")]
 mod alloc_support {

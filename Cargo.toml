@@ -40,6 +40,7 @@ simd-nightly = ["simd"]
 __internal_use_only_features_that_work_on_stable = ["alloc", "simd"]
 
 [dependencies]
+static_assertions = "1.1"  # TODO: remove
 zerocopy-derive = { version = "=0.7.0-alpha.3", path = "zerocopy-derive" }
 yoke = { version = "0.7" }
 
