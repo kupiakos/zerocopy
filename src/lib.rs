@@ -132,25 +132,26 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(feature = "simd-nightly", feature(stdsimd))]
 
+mod align;
+mod byte_slice;
 #[cfg(feature = "byteorder")]
 pub mod byteorder;
+mod bytes;
 #[doc(hidden)]
 pub mod derive_util;
-mod maybe_valid;
 mod from_bytes;
 mod from_zeroes;
-mod align;
-mod bytes;
-mod byte_slice;
+mod maybe_valid;
+mod size;
 pub use bytes::Bytes;
 mod try_from_bytes;
 pub(crate) mod util;
 
 #[cfg(feature = "byteorder")]
 pub use crate::byteorder::*;
+pub use byte_slice::{ByteSlice, ByteSliceMut, ReadOnlyByteSlice};
 pub use from_bytes::{FromBytes, LayoutError};
 pub use from_zeroes::FromZeroes;
-pub use byte_slice::{ByteSlice, ByteSliceMut, ReadOnlyByteSlice};
 pub use maybe_valid::{MaybeValid, NoInteriorMutable};
 pub use try_from_bytes::TryFromBytes;
 pub use zerocopy_derive::*;
@@ -186,7 +187,6 @@ use {
 mod zerocopy {
     pub(crate) use crate::*;
 }
-
 
 /// Types which are safe to treat as an immutable byte slice.
 ///
@@ -2310,7 +2310,6 @@ mod sealed {
 // implement them in a way that violated these behaviors, and would break our
 // unsafe code. Thus, we seal them and implement it only for known-good
 // reference types. For the same reason, they're unsafe traits.
-
 
 #[cfg(feature = "alloc")]
 mod alloc_support {
